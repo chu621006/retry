@@ -1,7 +1,7 @@
 import streamlit as st
 import pandas as pd
 import io
-import tabula # 或 import camelot, 如果您選擇使用 camelot-py
+import pdfplumber # 改用 pdfplumber，它不需要 Java
 
 # --- 1. GPA 轉換函數 ---
 def parse_gpa_to_numeric(gpa_str):
@@ -19,7 +19,8 @@ def parse_gpa_to_numeric(gpa_str):
         '抵免': 999.0, # Assign a very high value for '抵免' to ensure it passes
         '通過': 999.0  # Assign a very high value for '通過' to ensure it passes
     }
-    return gpa_map.get(gpa_str.strip(), 0.0) # Default to 0.0 for unknown or failing grades
+    # 處理可能存在的空白字元
+    return gpa_map.get(gpa_str.strip(), 0.0)
 
 # --- 2. 成績分析函數 ---
 def analyze_student_grades(df):
@@ -35,23 +36,24 @@ def analyze_student_grades(df):
     """
     GRADUATION_REQUIREMENT = 128
 
-    # Ensure '學分' is numeric, coercing errors to NaN then filling with 0
+    # 確保 '學分' 是數值，並將錯誤轉換為 NaN，然後填充為 0
     df['學分'] = pd.to_numeric(df['學分'], errors='coerce').fillna(0)
 
-    # Convert GPA to numeric representation for comparison
+    # 將 GPA 轉換為數值表示進行比較
     df['GPA_Numeric'] = df['GPA'].apply(parse_gpa_to_numeric)
 
-    # Determine if a course passed (C- equivalent or higher, or '抵免', or '通過')
-    # C- corresponds to a numeric value of 1.7 in our mapping
+    # 判斷課程是否通過 (C- 等價或更高，或 '抵免'，或 '通過')
+    # C- 對應到我們的映射中的數值 1.7
     df['是否通過'] = df['GPA_Numeric'].apply(lambda x: x >= 1.7)
 
-    # Filter for passed courses, handle the '勞作成績為:未通過' row which might appear
-    passed_courses_df = df[df['是否通過'] & (df['學分'] > 0)].copy() # Only count courses with > 0 credit
+    # 過濾出通過的課程，並且學分大於 0 (排除體育、軍訓等 0 學分的課程，除非它們明確算入畢業學分)
+    # 也排除可能存在的總結行，如「勞作成績為:未通過」
+    passed_courses_df = df[df['是否通過'] & (df['學分'] > 0)].copy()
 
-    # Calculate total earned credits
+    # 計算總獲得學分
     total_earned_credits = passed_courses_df['學分'].sum()
 
-    # Calculate remaining credits
+    # 計算距離畢業還差的學分
     remaining_credits_to_graduate = max(0, GRADUATION_REQUIREMENT - total_earned_credits)
 
     return total_earned_credits, remaining_credits_to_graduate, passed_courses_df
@@ -68,54 +70,47 @@ def main():
         st.success("檔案上傳成功！正在分析中...")
 
         try:
-            # 使用 tabula-py 提取 PDF 中的表格
-            # pages='all' 表示提取所有頁面
-            # lattice=True 或 stream=True 根據 PDF 表格類型選擇，通常 lattice 適合有明確線條的表格
-            # 根據您的 PDF 範例，表格結構清晰，試試看 lattice 模式
-            # 您提供的 PDF 中，科目名稱可能有多行，tabula-py 可能會將它們合併，這需要進一步確認效果
-            # 這裡需要指定 column names，因為 tabula-py 可能不會自動識別正確的 header
-            # 由於你的PDF沒有提供明確的header，可能需要手動定義columns並從row 0開始
-            raw_dfs = tabula.read_pdf(
-                io.BytesIO(uploaded_file.getvalue()),
-                pages='all',
-                multiple_tables=True,
-                lattice=True, # 嘗試使用 lattice 模式，因為表格線條較明顯
-                area = [90, 0, 800, 600], # 根據PDF內容大致劃定表格區域 [top, left, bottom, right] (in points)
-                # columns = [50, 100, 150, 300, 350, 400], # 如果表格有不規則的列，可以嘗試手動指定列的位置
-                pandas_options={'header': None} # 不將第一行識別為header，因為第一行可能是數據
-            )
+            # 使用 pdfplumber 讀取 PDF
+            with pdfplumber.open(io.BytesIO(uploaded_file.getvalue())) as pdf:
+                all_grades_data = []
+                for page in pdf.pages:
+                    # 嘗試從每個頁面提取表格
+                    # settings 可以根據您的 PDF 調整，例如 vertical_strategy, horizontal_strategy
+                    # 這裡使用預設的 setting
+                    tables = page.extract_tables()
 
-            if not raw_dfs:
+                    for table in tables:
+                        # 每個 table 是一個列表的列表 (list of lists)，代表表格的行和列
+                        # 我們需要找到包含成績數據的表格
+                        # 根據您的 PDF 範例，表格的第一行通常是標題，例如「學年度」
+                        if table and len(table[0]) >= 6 and '學年度' in table[0][0]:
+                            # 將表格轉換為 Pandas DataFrame
+                            df_table = pd.DataFrame(table[1:], columns=table[0]) # 跳過標題行
+                            all_grades_data.append(df_table)
+
+            if not all_grades_data:
                 st.warning("未能從 PDF 中提取任何表格。請檢查 PDF 格式或嘗試調整解析參數。")
                 return
 
             # 合併所有提取到的 DataFrame
-            full_grades_df = pd.DataFrame()
-            expected_columns = ["學年度", "學期", "選課代號", "科目名稱", "學分", "GPA"]
+            full_grades_df = pd.concat(all_grades_data, ignore_index=True)
 
-            for df_table in raw_dfs:
-                # 簡單的清理：去除可能不是成績數據的行（例如體育門檻、版權資訊等）
-                # 確保 DataFrame 至少有6列（對應我們的資料）
-                if df_table.shape[1] >= len(expected_columns):
-                    # 重新命名列，確保一致性
-                    df_table.columns = expected_columns[:df_table.shape[1]]
-
-                    # 過濾掉那些明顯不是成績行的資料，例如開頭不是數字的學年度
-                    # 並且排除"勞作成績為:未通過"這樣的總結行
-                    df_table = df_table[
-                        df_table['學年度'].astype(str).str.match(r'^\d{3}$') &
-                        ~df_table['學年度'].astype(str).str.contains('勞作成績')
-                    ]
-                    full_grades_df = pd.concat([full_grades_df, df_table], ignore_index=True)
-                else:
-                    st.warning(f"跳過一個格式不符的表格: {df_table.head()}")
-
-            # 清理最終的 DataFrame
+            # 數據清洗
             # 移除所有列都是 NaN 的行 (可能來自解析錯誤)
             full_grades_df.dropna(how='all', inplace=True)
-            # 移除可能由於PDF解析造成的空白字元
+            # 移除可能由於 PDF 解析造成的空白字元和換行符
             for col in full_grades_df.columns:
-                full_grades_df[col] = full_grades_df[col].astype(str).str.strip()
+                if col in ["學年度", "學期", "選課代號", "科目名稱", "學分", "GPA"]: # 僅清理相關列
+                    full_grades_df[col] = full_grades_df[col].astype(str).str.strip().str.replace('\n', ' ', regex=False)
+            
+            # 過濾掉那些明顯不是成績行的資料，例如開頭不是數字的學年度，或者勞作成績那一行
+            full_grades_df = full_grades_df[
+                full_grades_df['學年度'].astype(str).str.match(r'^\d{3}$') &
+                ~full_grades_df['科目名稱'].astype(str).str.contains('勞作成績', na=False)
+            ]
+            
+            # 確保 GPA 列是字串類型以進行 .strip() 操作
+            full_grades_df['GPA'] = full_grades_df['GPA'].astype(str).str.strip()
 
             if not full_grades_df.empty:
                 # 執行學分分析
@@ -135,7 +130,7 @@ def main():
 
         except Exception as e:
             st.error(f"處理 PDF 檔案時發生錯誤：{e}")
-            st.info("請確認您已正確安裝 `tabula-py` 並配置 Java 環境。若問題持續，可能是 PDF 格式較為複雜，需要調整 `tabula.read_pdf` 的參數。")
+            st.info("請確認您的 PDF 格式是否為清晰的表格。若問題持續，可能是 PDF 結構較為複雜，需要調整 `pdfplumber` 的表格提取設定。")
             st.exception(e) # 顯示更詳細的錯誤信息
 
 if __name__ == "__main__":
